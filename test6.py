@@ -35,7 +35,9 @@ if gpus:
 
 # ---------- CONFIG ----------
 # Use env var MODEL_PATH if provided, otherwise look for model file in the app folder.
-MODEL_PATH = os.environ.get("MODEL_PATH", "resnet50_lung_cancer.h5")
+MODEL_ID = "1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
+MODEL_PATH = "resnet50_lung_cancer.h5"
+MODEL_URL = f"https://drive.google.com/uc?id=1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
 INPUT_SIZE = (224, 224)
 CLASS_MAP = {0: "Normal", 1: "Benign", 2: "Malignant"}
 # ----------------------------
@@ -401,3 +403,4 @@ with col2:
             st.markdown(f"*You:* {text}")
         else:
             st.markdown(f"*Bot:* {text}")
+
