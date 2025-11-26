@@ -36,6 +36,7 @@ if gpus:
 # ---------- CONFIG ----------
 # Use env var MODEL_PATH if provided, otherwise look for model file in the app folder.
 MODEL_PATH = os.environ.get("MODEL_PATH", "resnet50_lung_cancer.h5")
+MODEL_DRIVE_ID = os.environ.get("1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN", None)
 INPUT_SIZE = (224, 224)
 CLASS_MAP = {0: "Normal", 1: "Benign", 2: "Malignant"}
 # ----------------------------
