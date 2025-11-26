@@ -12,7 +12,7 @@ import os
 import io
 import tempfile
 import traceback
-
+import gdown
 import streamlit as st
 import numpy as np
 from PIL import Image
@@ -35,9 +35,7 @@ if gpus:
 
 # ---------- CONFIG ----------
 # Use env var MODEL_PATH if provided, otherwise look for model file in the app folder.
-MODEL_ID = "1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
-MODEL_PATH = "resnet50_lung_cancer.h5"
-MODEL_URL = f"https://drive.google.com/uc?id=1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
+MODEL_PATH = os.environ.get("MODEL_PATH", "resnet50_lung_cancer.h5")
 INPUT_SIZE = (224, 224)
 CLASS_MAP = {0: "Normal", 1: "Benign", 2: "Malignant"}
 # ----------------------------
@@ -67,15 +65,33 @@ if logo is not None:
 @st.cache_resource(show_spinner=False)
 def load_keras_model(path):
     """
-    Load a Keras model from a local relative path.
+    Ensure model exists at 'path' (download from Google Drive if MODEL_DRIVE_ID provided).
     Returns (model_or_none, message).
     """
-    if path is None or not os.path.exists(path):
-        return None, f"Model not found at: {path}. Place the model file in the app folder or set MODEL_PATH environment variable."
     try:
+        if not os.path.exists(path):
+            if MODEL_DRIVE_ID:
+                url = f"https://drive.google.com/uc?id=1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
+                st.info(f"Model not found. Downloading from Drive id: 1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN (this may take a while)...")
+                # download to path
+                gdown.download(url, path, quiet=False)
+            else:
+                return None, f"Model not found at: {path}. Provide MODEL_DRIVE_ID env var or place model file in app folder."
+
+        # final existence check
+        if not os.path.exists(path):
+            return None, f"Model missing after download attempt: {path}"
+
         model = keras_load_model(path, compile=False)
         return model, f"Loaded model from: {path}"
+
     except Exception as e:
+        # remove potentially corrupted file so next start can re-download
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
         return None, f"Error loading model: {e}"
 
 # --- Preprocess helpers ---
@@ -403,4 +419,3 @@ with col2:
             st.markdown(f"*You:* {text}")
         else:
             st.markdown(f"*Bot:* {text}")
-
