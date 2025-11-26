@@ -1,0 +1,9 @@
+streamlit
+numpy
+opencv-python-headless
+Pillow
+gTTS
+gdown
+requests
+bcrypt
+python-dotenv
