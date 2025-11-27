@@ -22,7 +22,6 @@ COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip setuptools wheel \
  && pip install --no-cache-dir -r /app/requirements.txt
 
- COPY resnet50_lung_cancer.h5 /app/resnet50_lung_cancer.h5
 
 # Copy app code
 COPY . /app
