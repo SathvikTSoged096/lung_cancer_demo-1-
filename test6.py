@@ -33,7 +33,7 @@ if gpus:
         print("Could not set memory growth:", e)
 
 # ---------- CONFIG ----------# Use env var MODEL_PATH if provided, otherwise look for model file in the app folder.
-MODEL_DRIVE_ID = os.environ.get("1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN", None)
+MODEL_DRIVE_ID = os.getenv("MODEL_DRIVE_ID")
 MODEL_PATH = "/app/resnet50_lung_cancer.h5"
 INPUT_SIZE = (224, 224)
 CLASS_MAP = {0: "Normal", 1: "Benign", 2: "Malignant"}
@@ -418,4 +418,5 @@ with col2:
             st.markdown(f"*You:* {text}")
         else:
             st.markdown(f"*Bot:* {text}")
+
 
