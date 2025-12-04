@@ -8,6 +8,7 @@ Single-file Streamlit demo with robust Grad-CAM visualization.
 - Kannada chatbot with TTS
 """
 
+import re
 import os
 import io
 import time
@@ -65,7 +66,19 @@ if logo is not None:
         pass
 
 
-# ---------- Robust downloader (stream + retries) ----------
+# ---------- Robust downloader (stream + retries + HDF5 check) ----------
+HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+
+
+def _is_hdf5_file(path, nbytes=8):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(nbytes)
+        return head.startswith(HDF5_MAGIC)
+    except Exception:
+        return False
+
+
 def free_space_mb(path="/"):
     try:
         stv = os.statvfs(path)
@@ -76,44 +89,72 @@ def free_space_mb(path="/"):
 
 def download_from_drive_stream(drive_id, out_path, max_retries=4, chunk_size=32768):
     """
-    Stream-download a Google Drive file (handles confirm token cookie).
+    Robust download from Google Drive.
+    - Handles confirm token cookie (download_warning) and parses confirm token from HTML links.
+    - Verifies HDF5 signature after download.
+    - Falls back to gdown if streaming approach yields an HTML/quota page.
     Returns (True, None) on success or (False, reason_str) on failure.
     """
-    url = f"https://drive.google.com/uc?export=download&id={drive_id}"
+    base_url = f"https://drive.google.com/uc?export=download&id={drive_id}"
     session = requests.Session()
 
     for attempt in range(1, max_retries + 1):
         try:
-            st.write(f"Attempt {attempt} — free disk: {free_space_mb()} MB")
+            st.write(f"Download attempt {attempt} — free disk: {free_space_mb()} MB")
             if free_space_mb() and free_space_mb() < 200:
                 st.error(f"Low disk space (<200MB). Free: {free_space_mb()} MB")
                 return False, "low_disk"
 
-            resp = session.get(url, stream=True, timeout=30)
-            # If Drive returns an HTML page (confirm/virus/quota), try to find confirm token cookie
-            if 'text/html' in resp.headers.get('Content-Type', ''):
+            resp = session.get(base_url, stream=True, timeout=30)
+            content_type = resp.headers.get("Content-Type", "")
+
+            # If Drive returned HTML (confirm / quota / virus page), try to extract confirm token
+            confirm_token = None
+            if 'text/html' in content_type.lower():
+                text = resp.text
+                st.write("Drive returned HTML; trying to find confirm token/cookie...")
+
+                # 1) cookie-based token (commonly 'download_warning')
                 for k, v in resp.cookies.items():
-                    if k.startswith('download_warning'):
-                        confirm = v
-                        resp = session.get(url + f"&confirm={confirm}", stream=True, timeout=30)
+                    if k.startswith("download_warning") or k.startswith("confirm"):
+                        confirm_token = v
+                        st.write(f"Found confirm token in cookies: {k}={confirm_token}")
                         break
 
+                # 2) fallback: parse HTML for confirm param in links/buttons
+                if confirm_token is None:
+                    m = re.search(r"confirm=([0-9A-Za-z_\-]+)&", text)
+                    if m:
+                        confirm_token = m.group(1)
+                        st.write("Found confirm token in HTML (regex).")
+                    else:
+                        m2 = re.search(r"uc-download-link\" href=\"[^\"]*confirm=([0-9A-Za-z_\-]+)", text)
+                        if m2:
+                            confirm_token = m2.group(1)
+                            st.write("Found confirm token in HTML (uc-download-link).")
+
+                # If we found a token, request again with confirm
+                if confirm_token:
+                    confirm_url = base_url + f"&confirm={confirm_token}"
+                    st.write("Requesting confirmed URL...")
+                    resp = session.get(confirm_url, stream=True, timeout=30)
+                else:
+                    st.write("No confirm token found in HTML. Proceeding — may get a small HTML file.")
+
             if resp.status_code != 200:
-                st.error(f"Download HTTP {resp.status_code}")
+                st.error(f"Drive HTTP {resp.status_code}")
                 return False, f"http_{resp.status_code}"
 
+            tmp_path = out_path + ".part"
             total = resp.headers.get('Content-Length')
             total = int(total) if total and total.isdigit() else None
             written = 0
-            tmp_path = out_path + ".part"
-
+            start = time.time()
             with open(tmp_path, "wb") as f:
-                start = time.time()
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
                         written += len(chunk)
-                        # update progress UI
                         if total:
                             pct = min(1.0, written / total)
                             try:
@@ -122,17 +163,55 @@ def download_from_drive_stream(drive_id, out_path, max_retries=4, chunk_size=327
                                 pass
                             st.write(f"{written//1024//1024} MB / {math.ceil(total/1024/1024)} MB")
                         else:
-                            st.write(f"Downloaded {written//1024//1024} MB ...")
+                            if written % (1024*1024*10) < chunk_size:
+                                st.write(f"Downloaded {written//1024//1024} MB ...")
+
             os.replace(tmp_path, out_path)
             elapsed = time.time() - start
-            st.success(f"Downloaded {written//1024//1024} MB in {elapsed:.1f}s")
-            return True, None
+            st.write(f"Attempt {attempt} complete — {written//1024//1024} MB in {elapsed:.1f}s")
+
+            # Verify HDF5 signature
+            if _is_hdf5_file(out_path):
+                st.success("Downloaded file looks like a valid HDF5 (.h5) file.")
+                return True, None
+            else:
+                st.warning("Downloaded file is NOT a valid HDF5 file (likely HTML or corrupted). Will try gdown fallback.")
+
+                # attempt gdown fallback (often handles Drive confirm pages)
+                try:
+                    import gdown
+                    st.write("Running gdown fallback...")
+                    gdown_url = f"https://drive.google.com/uc?id={drive_id}"
+                    gdown.download(gdown_url, out_path, quiet=False)
+                    if _is_hdf5_file(out_path):
+                        st.success("gdown fallback succeeded and file looks like HDF5.")
+                        return True, None
+                    else:
+                        st.error("gdown downloaded file but it is not valid HDF5 either.")
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                        return False, "not_hdf5_after_gdown"
+                except Exception as e:
+                    st.error(f"gdown fallback failed: {e}")
+                    try:
+                        if os.path.exists(out_path):
+                            os.remove(out_path)
+                    except Exception:
+                        pass
+                    return False, f"gdown_error:{e}"
 
         except requests.exceptions.RequestException as e:
-            st.warning(f"Attempt {attempt} failed: {e}")
+            st.warning(f"Network error on attempt {attempt}: {e}")
             time.sleep(2 ** attempt)
         except Exception as e:
-            st.error(f"Unexpected error during download: {e}")
+            st.error(f"Unexpected error: {e}")
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
             return False, str(e)
 
     return False, "max_retries"
@@ -349,9 +428,9 @@ def run_inference_with_gradcam(model, volume_array, return_gradcam=True):
 
 # --- Kannada response templates & NLU ---
 KANNADA_TEMPLATES = {
-    "greeting": "ನಮಸ್ತೆ! ನಾನು ನಿಮ್ಮ ಲಂಗ್-ಕ್ಯಾನ್ಸರ್ ಪ್ರೋಟೋಟೈಪ್ ಚಾಟ್‌ಬಾಟ್. ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
+    "greeting": "ನಮಸ್ತೆ! 나는 ನಿಮ್ಮ ಲಂಗ್-ಕ್ಯಾನ್ಸರ್ ಪ್ರೋಟೋಟೈಪ್ ಚಾಟ್‌ಬಾಟ್. ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
     "inference_result": "ಮೌಲ್ಯಮಾಪನ ಫಲಿತಾಂಶ:\n\nಫಲಿತಾಂಶ: {label}\nconfidence (ಸ್ಕೋರ್): {score:.3f}\nನೋಟ್: {notes}",
-    "explain_how": "ಈ ಮಾಡೆಲ್ 3D CT ವಾಲ್ಯೂಮ್ ಗಳನ್ನು ಒಳಗೆ ತೆಗೆದುಕೊಂಡು ಕಂಡುಬರುವ ಗುಣಲಕ್ಷಣಗಳನ್ನು ಆಧರಿಸಿ ಅನುಮಾನಿತ ತಂತು/ನೋಡ್ ಗಳನ್ನು ಗುರುತಿಸುತ್ತದೆ.",
+    "explain_how": "ಈ ಮಾಡೆಲ್ 3D CT ವಾಲ್ಯೂಮ್ ಗಳನ್ನು ಒಳಗೆ ತೆಗೆದುಕೊಂಡು ಕಂಡುಬರುವ ಗುಣಲಕ್ಷಣಗಳನ್ನು ಆಧರಿಸಿ ಅನುಮಾನಿತ तಂತು/ನೋಡ್ ಗಳನ್ನು ಗುರುತಿಸುತ್ತದೆ.",
     "accuracy": "ಮಾಡೆಲ್‌ಗಾಗಿ ಉದಾಹರಣೆ accuracy = {acc:.2f}.",
     "limitations": "ಸೀಮಿತತೆ: ಇದು ಡೆಮೊ; ವೈದ್ಯ ಸಲಹೆ ಅವಶ್ಯಕ.",
     "thanks": "ಧನ್ಯವಾದಗಳು!"
