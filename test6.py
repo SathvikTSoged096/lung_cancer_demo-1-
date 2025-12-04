@@ -10,40 +10,46 @@ Single-file Streamlit demo with robust Grad-CAM visualization.
 
 import os
 import io
+import time
+import math
 import tempfile
 import traceback
-import gdown
+import requests
 import streamlit as st
 import numpy as np
 from PIL import Image
 import cv2
 from gtts import gTTS
+
 import tensorflow as tf
 from tensorflow.keras.models import load_model as keras_load_model
 
-import tensorflow as tf
-
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("Enabled memory growth for GPUs")
-    except Exception as e:
-        print("Could not set memory growth:", e)
-
-# ---------- CONFIG ----------# Use env var MODEL_PATH if provided, otherwise look for model file in the app folder.
-MODEL_DRIVE_ID = os.getenv("MODEL_DRIVE_ID")
-MODEL_PATH = "/app/resnet50_lung_cancer.h5"
+# ---------- CONFIG ----------
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/resnet50_lung_cancer.h5")
+MODEL_DRIVE_ID = os.getenv("MODEL_DRIVE_ID")  # set this in Render / docker env
 INPUT_SIZE = (224, 224)
 CLASS_MAP = {0: "Normal", 1: "Benign", 2: "Malignant"}
 # ----------------------------
 
 st.set_page_config(page_title="Lung Cancer Demo Chatbot (Kannada)", layout="wide")
 
+# GPU memory growth (works if GPU present locally)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception:
+                pass
+        print("Enabled memory growth for GPUs")
+    except Exception as e:
+        print("Could not set memory growth:", e)
+
+
 # Try loading logo from a few sensible relative locations (works in Docker)
 logo = None
-for candidate in [ "imagel.png", "assets/imagel.png"]:
+for candidate in ["imagel.png", "assets/imagel.png", "logo2.png", "assets/logo2.png", "logo.png", "assets/logo.png"]:
     try:
         if os.path.exists(candidate):
             logo = Image.open(candidate)
@@ -52,46 +58,133 @@ for candidate in [ "imagel.png", "assets/imagel.png"]:
         logo = None
         break
 
-# If logo loaded, show it (safe)
 if logo is not None:
     try:
         st.image(logo, width=150)
     except Exception:
-        # fail silently if UI can't render image
         pass
 
-# --- Model loader (cached) ---
-@st.cache_resource(show_spinner=False)
-def load_keras_model(path):
+
+# ---------- Robust downloader (stream + retries) ----------
+def free_space_mb(path="/"):
+    try:
+        stv = os.statvfs(path)
+        return (stv.f_bavail * stv.f_frsize) // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def download_from_drive_stream(drive_id, out_path, max_retries=4, chunk_size=32768):
     """
-    Ensure model exists at 'path' (download from Google Drive if MODEL_DRIVE_ID provided).
-    Returns (model_or_none, message).
+    Stream-download a Google Drive file (handles confirm token cookie).
+    Returns (True, None) on success or (False, reason_str) on failure.
+    """
+    url = f"https://drive.google.com/uc?export=download&id={drive_id}"
+    session = requests.Session()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            st.write(f"Attempt {attempt} — free disk: {free_space_mb()} MB")
+            if free_space_mb() and free_space_mb() < 200:
+                st.error(f"Low disk space (<200MB). Free: {free_space_mb()} MB")
+                return False, "low_disk"
+
+            resp = session.get(url, stream=True, timeout=30)
+            # If Drive returns an HTML page (confirm/virus/quota), try to find confirm token cookie
+            if 'text/html' in resp.headers.get('Content-Type', ''):
+                for k, v in resp.cookies.items():
+                    if k.startswith('download_warning'):
+                        confirm = v
+                        resp = session.get(url + f"&confirm={confirm}", stream=True, timeout=30)
+                        break
+
+            if resp.status_code != 200:
+                st.error(f"Download HTTP {resp.status_code}")
+                return False, f"http_{resp.status_code}"
+
+            total = resp.headers.get('Content-Length')
+            total = int(total) if total and total.isdigit() else None
+            written = 0
+            tmp_path = out_path + ".part"
+
+            with open(tmp_path, "wb") as f:
+                start = time.time()
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        written += len(chunk)
+                        # update progress UI
+                        if total:
+                            pct = min(1.0, written / total)
+                            try:
+                                st.progress(pct)
+                            except Exception:
+                                pass
+                            st.write(f"{written//1024//1024} MB / {math.ceil(total/1024/1024)} MB")
+                        else:
+                            st.write(f"Downloaded {written//1024//1024} MB ...")
+            os.replace(tmp_path, out_path)
+            elapsed = time.time() - start
+            st.success(f"Downloaded {written//1024//1024} MB in {elapsed:.1f}s")
+            return True, None
+
+        except requests.exceptions.RequestException as e:
+            st.warning(f"Attempt {attempt} failed: {e}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            st.error(f"Unexpected error during download: {e}")
+            return False, str(e)
+
+    return False, "max_retries"
+
+
+# ---------- Model loader (cached) ----------
+@st.cache_resource(show_spinner=True)
+def load_keras_model():
+    """
+    Ensure model exists at MODEL_PATH; if missing and MODEL_DRIVE_ID provided, try to download.
+    Returns (model_or_none, message_str)
     """
     try:
-        if not os.path.exists(path):
-            if MODEL_DRIVE_ID:
-                url = f"https://drive.google.com/uc?id=1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN"
-                st.info(f"Model not found. Downloading from Drive id: 1s7c8s4nYH0oBWGBLNb_d_q5Loc0hl4MN (this may take a while)...")
-                # download to path
-                gdown.download(url, path, quiet=False)
-            else:
-                return None, f"Model not found at: {path}. Provide MODEL_DRIVE_ID env var or place model file in app folder."
+        # If model file already present
+        if os.path.exists(MODEL_PATH):
+            return keras_load_model(MODEL_PATH, compile=False), f"Loaded model from: {MODEL_PATH}"
 
-        # final existence check
-        if not os.path.exists(path):
-            return None, f"Model missing after download attempt: {path}"
+        # If MODEL_DRIVE_ID is set, try to download
+        if MODEL_DRIVE_ID:
+            st.info(f"Model not found. Downloading from Drive id: {MODEL_DRIVE_ID} (this may take a while)...")
+            ok, reason = download_from_drive_stream(MODEL_DRIVE_ID, MODEL_PATH, max_retries=4)
+            if not ok:
+                st.error(f"Stream download failed: {reason}. Attempting fallback using gdown...")
+                try:
+                    import gdown
+                    url = f"https://drive.google.com/uc?id={MODEL_DRIVE_ID}"
+                    gdown.download(url, MODEL_PATH, quiet=False)
+                    if not os.path.exists(MODEL_PATH):
+                        st.error("gdown fallback also failed.")
+                        return None, "gdown_failed"
+                except Exception as e:
+                    st.error(f"gdown fallback error: {e}")
+                    return None, f"gdown_error: {e}"
+        else:
+            return None, f"Model not found at: {MODEL_PATH}. Set MODEL_DRIVE_ID env var or place model file in app folder."
 
-        model = keras_load_model(path, compile=False)
-        return model, f"Loaded model from: {path}"
+        # final check and load
+        if not os.path.exists(MODEL_PATH):
+            return None, f"Model missing after download attempt: {MODEL_PATH}"
+
+        model = keras_load_model(MODEL_PATH, compile=False)
+        return model, f"Loaded model from: {MODEL_PATH}"
 
     except Exception as e:
-        # remove potentially corrupted file so next start can re-download
+        # remove possibly corrupted file
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(MODEL_PATH):
+                os.remove(MODEL_PATH)
         except Exception:
             pass
         return None, f"Error loading model: {e}"
+
 
 # --- Preprocess helpers ---
 def preprocess_slice(slice_img, target_size=INPUT_SIZE):
@@ -102,6 +195,7 @@ def preprocess_slice(slice_img, target_size=INPUT_SIZE):
     img = img / 255.0
     return img.astype(np.float32)
 
+
 # --- Find last conv layer robustly ---
 def find_last_conv_layer(model):
     for layer in reversed(model.layers):
@@ -111,6 +205,7 @@ def find_last_conv_layer(model):
         if layer.__class__.__name__.lower().startswith('conv'):
             return layer.name
     raise ValueError("No convolutional layer found in model to compute Grad-CAM.")
+
 
 # --- Grad-CAM helper (robust to multi-output models) ---
 def make_gradcam_heatmap(img_array, model, pred_index=None, last_conv_layer_name=None):
@@ -147,6 +242,7 @@ def make_gradcam_heatmap(img_array, model, pred_index=None, last_conv_layer_name
     heatmap /= max_val
     return heatmap.numpy().astype(np.float32)
 
+
 # --- Overlay helper ---
 def overlay_heatmap_on_image(orig_rgb, heatmap, thresh=0.35):
     if orig_rgb.dtype != np.uint8:
@@ -172,12 +268,13 @@ def overlay_heatmap_on_image(orig_rgb, heatmap, thresh=0.35):
 
     return overlay_rgb, annotated_rgb
 
+
 # --- Robust predict handling + Grad-CAM pipeline ---
 def run_inference_with_gradcam(model, volume_array, return_gradcam=True):
     try:
         if model is None:
             mean_val = float(np.nanmean(volume_array))
-            score = 1.0 / (1.0 + np.exp(-0.01*(mean_val-100)))
+            score = 1.0 / (1.0 + np.exp(-0.01 * (mean_val - 100)))
             label = "ಸ್ಥೂಲ ಸಂಶಯ (Malignant)" if score > 0.5 else "ಸಂದೇಹದಿಲ್ಲ (Benign)"
             return {"label": label, "score": float(score), "probs": None, "notes": "Demo inference; replace with real model.", "gradcam": None}
 
@@ -249,6 +346,7 @@ def run_inference_with_gradcam(model, volume_array, return_gradcam=True):
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc(), "gradcam": None}
 
+
 # --- Kannada response templates & NLU ---
 KANNADA_TEMPLATES = {
     "greeting": "ನಮಸ್ತೆ! ನಾನು ನಿಮ್ಮ ಲಂಗ್-ಕ್ಯಾನ್ಸರ್ ಪ್ರೋಟೋಟೈಪ್ ಚಾಟ್‌ಬಾಟ್. ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
@@ -259,21 +357,23 @@ KANNADA_TEMPLATES = {
     "thanks": "ಧನ್ಯವಾದಗಳು!"
 }
 
+
 def detect_intent(user_text):
     t = user_text.strip().lower()
-    if any(x in t for x in ["hello","hi","namaste","ನಮಸ್ತೆ","ಹಲೋ","hey"]):
+    if any(x in t for x in ["hello", "hi", "namaste", "ನಮಸ್ತೆ", "ಹಲೋ", "hey"]):
         return "greeting"
-    if any(x in t for x in ["predict","inference","run inference","result","ಫಲ","ಫಲಿತಾಂಶ"]):
+    if any(x in t for x in ["predict", "inference", "run inference", "result", "ಫಲ", "ಫಲಿತಾಂಶ"]):
         return "predict"
-    if any(x in t for x in ["how","work","ಹೇಗೆ","ಮಾಡುತ್ತದೆ","explain","ವಿವರಣೆ"]):
+    if any(x in t for x in ["how", "work", "ಹೇಗೆ", "ಮಾಡುತ್ತದೆ", "explain", "ವಿವರಣೆ"]):
         return "explain"
-    if any(x in t for x in ["accuracy","precision","sensitivity","acc"]):
+    if any(x in t for x in ["accuracy", "precision", "sensitivity", "acc"]):
         return "accuracy"
-    if any(x in t for x in ["limitations","limits","ಸೀಮಿತತೆ"]):
+    if any(x in t for x in ["limitations", "limits", "ಸೀಮಿತತೆ"]):
         return "limitations"
-    if any(x in t for x in ["thanks","thank","ಧನ್ಯ","bye"]):
+    if any(x in t for x in ["thanks", "thank", "ಧನ್ಯ", "bye"]):
         return "thanks"
     return "unknown"
+
 
 def answer_in_kannada(intent, context=None):
     if intent == "greeting":
@@ -291,6 +391,7 @@ def answer_in_kannada(intent, context=None):
         return "ದಯವಿಟ್ಟು JPG ಸ್ಲೈಸುಗಳನ್ನು ಅಥವಾ .npy ಫೈಲ್ ಅನ್ನು ಅಪ್‌ಲೋಡ್ ಮಾಡಿ ಮತ್ತು 'Run Inference' ಒತ್ತಿ."
     return "ಕ್ಷಮಿಸಿ, ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ."
 
+
 # --- TTS helper ---
 def tts_kannada(text):
     try:
@@ -302,26 +403,27 @@ def tts_kannada(text):
         st.error("TTS error: " + str(e))
         return None
 
+
 # --- Streamlit UI ---
 st.title("Lung Cancer Detector")
-st.markdown("*DISCLAIMER:* This is a demo prototype. Not a medical diagnosis tool.")
+st.markdown("*DISCLAIMER:* This is a demo prototype. Not a medical diagnosis tool.*")
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("Model / Inference")
-    model, model_msg = load_keras_model(MODEL_PATH)
+    model, model_msg = load_keras_model()
     if model is not None:
         st.success(model_msg)
     else:
         st.info(model_msg)
 
-    uploaded_files = st.file_uploader("Upload CT scan slices (.jpg) or a single .npy", type=["jpg","jpeg","npy"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload CT scan slices (.jpg) or a single .npy", type=["jpg", "jpeg", "npy"], accept_multiple_files=True)
     arr = None
 
     if uploaded_files:
         npy_files = [f for f in uploaded_files if f.name.lower().endswith('.npy')]
-        jpg_files = [f for f in uploaded_files if f.name.lower().endswith(('.jpg','.jpeg'))]
+        jpg_files = [f for f in uploaded_files if f.name.lower().endswith(('.jpg', '.jpeg'))]
 
         if len(npy_files) == 1 and len(uploaded_files) == 1:
             arr = np.load(io.BytesIO(npy_files[0].read()))
@@ -418,5 +520,3 @@ with col2:
             st.markdown(f"*You:* {text}")
         else:
             st.markdown(f"*Bot:* {text}")
-
-
